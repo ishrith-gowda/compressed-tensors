@@ -215,11 +215,8 @@ class OffloadCache(MutableMapping, ABC):
             self.offloaded_values[key] = value
             return
 
-        # invalidate onload cache
-        offloaded = self.offloaded_values.get(key, None)
-        if offloaded in self.keep_onloaded_values:
-            del self.keep_onloaded_values[offloaded]
-        del offloaded
+        if key in self:
+            del self[key]
 
         # synchronously offload value
         self.offloaded_values[key] = self.offload(value)
