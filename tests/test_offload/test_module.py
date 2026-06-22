@@ -204,6 +204,7 @@ def test_forward_signature(linear: torch.nn.Linear, cache):
 
 
 @pytest.mark.unit
+@requires_gpu
 def test_set_item(offloaded_linear: torch.nn.Linear):
     # update
     update = torch.nn.Parameter(
@@ -211,18 +212,21 @@ def test_set_item(offloaded_linear: torch.nn.Linear):
     )
     offloaded_linear.weight = update
     with disable_onloading():
-        assert offloaded_linear.weight is not update
+        assert offloaded_linear.weight is update
 
-    # overwrite with different size
-    overwrite = torch.nn.Parameter(
-        torch.rand(6, 6, device=OFFLOAD_DEVICE), requires_grad=False
-    )
-    offloaded_linear.weight = overwrite
-    with disable_onloading():
-        assert offloaded_linear.weight is overwrite
+    for size in (5, 6):
+        overwrite = torch.nn.Parameter(
+            torch.rand(size, size, device=ONLOAD_DEVICE), requires_grad=False
+        )
+        offloaded_linear.weight = overwrite
+        with disable_onloading():
+            offloaded = offloaded_linear.weight
+            assert offloaded.device == OFFLOAD_DEVICE
+            assert torch.equal(offloaded.to(overwrite), overwrite)
 
 
 @pytest.mark.unit
+@requires_gpu
 def test_set_item_buffers(offloaded_linear: torch.nn.Linear):
     # common case: registering buffers of difference sizes twice
     new = torch.rand(5)
@@ -230,7 +234,10 @@ def test_set_item_buffers(offloaded_linear: torch.nn.Linear):
     with disable_onloading():
         assert offloaded_linear.buffer is new
 
-    overwrite = torch.rand(6)
-    offloaded_linear.register_buffer("buffer", overwrite, persistent=False)
-    with disable_onloading():
-        assert offloaded_linear.buffer is overwrite
+    for size in (5, 6):
+        overwrite = torch.rand(size, device=ONLOAD_DEVICE)
+        offloaded_linear.register_buffer("buffer", overwrite, persistent=False)
+        with disable_onloading():
+            offloaded = offloaded_linear.buffer
+            assert offloaded.device == OFFLOAD_DEVICE
+            assert torch.equal(offloaded.to(overwrite), overwrite)
