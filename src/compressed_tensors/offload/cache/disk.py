@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import contextlib
 import os
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Iterator, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -18,6 +21,80 @@ from safetensors.torch import save_file
 
 if TYPE_CHECKING:
     from torch._prims_common import DeviceLikeType
+
+
+# Open safetensors handles held for the duration of `disk_load_context`, keyed by
+# (path, device). Thread local because handles are not safe to share across
+# threads and callers may prefetch on a background thread.
+_open_files = threading.local()
+
+# Bound on concurrently held handles, so a model with many shards cannot exhaust
+# the process file descriptor limit. Reads within one subgraph touch very few
+# distinct files, so a small cap gives up nothing in practice.
+_MAX_OPEN_FILES = 16
+
+
+@contextlib.contextmanager
+def disk_load_context() -> Iterator[None]:
+    """
+    Hold safetensors file handles open for the duration of the block.
+
+    `safe_open` parses a header describing every tensor in the file, so the cost
+    of opening is proportional to the number of tensors the file holds. Opening
+    once per tensor therefore makes a group of N reads from one shard O(N**2).
+    Reusing the handle makes the same group linear.
+
+    This is opt in. Outside the context, `DiskCache.onload` opens and closes per
+    read exactly as before, so nothing changes for callers that do not use it.
+
+    Nesting is allowed; handles are closed when the outermost context exits.
+
+    Example:
+        with disk_load_context():
+            for subgraph in subgraphs:
+                subgraph(batch)
+    """
+    if getattr(_open_files, "depth", 0) == 0:
+        _open_files.cache = OrderedDict()
+    _open_files.depth = getattr(_open_files, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _open_files.depth -= 1
+        if _open_files.depth == 0:
+            cache, _open_files.cache = _open_files.cache, None
+            for handle in cache.values():
+                handle.__exit__(None, None, None)
+
+
+@contextlib.contextmanager
+def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
+    """
+    Yield a safetensors handle for `file_path`, reusing an open one if the
+    caller is inside `disk_load_context`.
+
+    Outside that context this is an ordinary open/close, which keeps the
+    uninstrumented path byte for byte what it was.
+    """
+    cache = getattr(_open_files, "cache", None)
+    if cache is None:
+        with safe_open(file_path, framework="pt", device=device) as file:
+            yield file
+        return
+
+    key = (file_path, device)
+    handle = cache.get(key)
+    if handle is None:
+        handle = safe_open(file_path, framework="pt", device=device)
+        handle.__enter__()
+        cache[key] = handle
+        # Evict oldest first, never the handle just requested.
+        while len(cache) > _MAX_OPEN_FILES:
+            _, evicted = cache.popitem(last=False)
+            evicted.__exit__(None, None, None)
+    else:
+        cache.move_to_end(key)
+    yield handle
 
 
 class DiskCache(OffloadCache):
@@ -71,9 +148,7 @@ class DiskCache(OffloadCache):
         weight_info = self.index[offloaded]
         device = _get_safe_open_device(self.onload_device)
 
-        with safe_open(
-            weight_info["safetensors_file"], framework="pt", device=device
-        ) as file:
+        with _opened(weight_info["safetensors_file"], device) as file:
             onloaded = file.get_tensor(weight_info["weight_name"])
             onloaded = to_tensor(onloaded, offloaded)
             onloaded = onloaded.to(getattr(torch, weight_info["dtype"]))

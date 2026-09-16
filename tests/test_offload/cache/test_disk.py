@@ -5,8 +5,9 @@ import os
 
 import pytest
 import torch
-from compressed_tensors.offload.cache.disk import DiskCache
+from compressed_tensors.offload.cache.disk import DiskCache, disk_load_context
 from safetensors import safe_open
+from safetensors.torch import save_file
 from tests.test_offload.cache.helpers import (
     _test_delete,
     _test_disable_offloading,
@@ -128,3 +129,148 @@ def test_files(tmp_path):
     files = os.listdir(offload_dir)
     assert len(DiskCache.index) == 0
     assert len(files) == 0
+
+
+def _counting_safe_open(monkeypatch):
+    """Patch `safe_open` in the disk cache module and count how often it opens."""
+    from compressed_tensors.offload.cache import disk as disk_module
+
+    real = disk_module.safe_open
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(disk_module, "safe_open", counted)
+    return calls
+
+
+def _cache_with_weights(offload_dir, names):
+    """A DiskCache holding `names`, each in its own backing file."""
+    DiskCache.index = {}
+    cache = DiskCache("cpu", offload_dir=str(offload_dir))
+    for i, name in enumerate(names):
+        cache[name] = torch.full((4,), float(i))
+    return cache
+
+
+@pytest.mark.unit
+def test_disk_load_context_reuses_one_handle_per_file(tmp_path, monkeypatch):
+    """The point of the context: N reads from one file cost one open, not N.
+
+    `safe_open` parses a header covering every tensor in the file, so opening
+    per read is O(N) per read and O(N**2) across the group. This asserts the
+    group collapses to a single open.
+    """
+    from compressed_tensors.offload.cache.disk import _opened
+
+    names = [f"w{i}" for i in range(6)]
+    shard = tmp_path / "shard.safetensors"
+    save_file({n: torch.full((4,), float(i)) for i, n in enumerate(names)}, shard)
+
+    opens = _counting_safe_open(monkeypatch)
+    with disk_load_context():
+        for i, name in enumerate(names):
+            with _opened(str(shard), "cpu") as file:
+                assert_tensor_equal(file.get_tensor(name), torch.full((4,), float(i)))
+    assert len(opens) == 1, f"expected a single open, got {len(opens)}"
+
+    # same reads outside the context open once each
+    opens.clear()
+    for name in names:
+        with _opened(str(shard), "cpu") as file:
+            file.get_tensor(name)
+    assert len(opens) == len(names)
+
+
+@pytest.mark.unit
+def test_without_context_opens_per_read(tmp_path, monkeypatch):
+    """Outside the context the behaviour is unchanged, one open per read."""
+    offload_dir = tmp_path / "offload_dir"
+    os.mkdir(offload_dir)
+    names = [f"w{i}" for i in range(4)]
+    cache = _cache_with_weights(offload_dir, names)
+
+    opens = _counting_safe_open(monkeypatch)
+    outside = [cache[name] for name in names]
+    assert len(opens) == len(names)
+
+    opens.clear()
+    with disk_load_context():
+        inside = [cache[name] for name in names]
+
+    for a, b in zip(outside, inside):
+        assert_tensor_equal(a, b)
+
+
+@pytest.mark.unit
+def test_disk_load_context_closes_handles_on_exit(tmp_path):
+    """Handles must actually be closed on exit, not merely dropped.
+
+    Asserts against the handle itself rather than the cache dict, because
+    clearing the dict while leaking the descriptors would otherwise pass.
+    """
+    from compressed_tensors.offload.cache import disk as disk_module
+    from compressed_tensors.offload.cache.disk import _opened
+
+    shard = tmp_path / "shard.safetensors"
+    save_file({"a": torch.zeros(4)}, shard)
+
+    with disk_load_context():
+        with _opened(str(shard), "cpu") as file:
+            file.get_tensor("a")
+        held = list(disk_module._open_files.cache.values())
+        assert held, "expected a cached handle"
+    assert disk_module._open_files.cache is None
+    for handle in held:
+        with pytest.raises(Exception, match="closed"):
+            handle.get_tensor("a")
+
+    # and the same when the block raises
+    with pytest.raises(RuntimeError):
+        with disk_load_context():
+            with _opened(str(shard), "cpu") as file:
+                file.get_tensor("a")
+            held = list(disk_module._open_files.cache.values())
+            raise RuntimeError("boom")
+    for handle in held:
+        with pytest.raises(Exception, match="closed"):
+            handle.get_tensor("a")
+
+
+@pytest.mark.unit
+def test_disk_load_context_nests(tmp_path, monkeypatch):
+    """An inner context must not close handles the outer one is still using."""
+    from compressed_tensors.offload.cache import disk as disk_module
+
+    offload_dir = tmp_path / "offload_dir"
+    os.mkdir(offload_dir)
+    cache = _cache_with_weights(offload_dir, ["w0"])
+
+    opens = _counting_safe_open(monkeypatch)
+    with disk_load_context():
+        cache["w0"]
+        with disk_load_context():
+            cache["w0"]
+        assert disk_module._open_files.cache is not None
+        cache["w0"]
+    assert disk_module._open_files.cache is None
+    assert len(opens) == 1
+
+
+@pytest.mark.unit
+def test_disk_load_context_bounds_open_handles(tmp_path, monkeypatch):
+    """More distinct files than the cap must not hold unbounded descriptors."""
+    from compressed_tensors.offload.cache import disk as disk_module
+
+    offload_dir = tmp_path / "offload_dir"
+    os.mkdir(offload_dir)
+    count = disk_module._MAX_OPEN_FILES + 4
+    names = [f"w{i}" for i in range(count)]
+    cache = _cache_with_weights(offload_dir, names)
+
+    with disk_load_context():
+        for name in names:
+            cache[name]
+        assert len(disk_module._open_files.cache) <= disk_module._MAX_OPEN_FILES
