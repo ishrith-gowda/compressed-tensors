@@ -5,7 +5,8 @@ import os
 
 import pytest
 import torch
-from compressed_tensors.offload.cache.disk import DiskCache, disk_load_context
+from compressed_tensors.offload.cache.disk import DiskCache
+from compressed_tensors.offload.cache.disk_utils import disk_load_context
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tests.test_offload.cache.helpers import (
@@ -133,7 +134,7 @@ def test_files(tmp_path):
 
 def _counting_safe_open(monkeypatch):
     """Patch `safe_open` in the disk cache module and count how often it opens."""
-    from compressed_tensors.offload.cache import disk as disk_module
+    from compressed_tensors.offload.cache import disk_utils as disk_module
 
     real = disk_module.safe_open
     calls = []
@@ -163,7 +164,7 @@ def test_disk_load_context_reuses_one_handle_per_file(tmp_path, monkeypatch):
     per read is O(N) per read and O(N**2) across the group. This asserts the
     group collapses to a single open.
     """
-    from compressed_tensors.offload.cache.disk import _opened
+    from compressed_tensors.offload.cache.disk_utils import _opened
 
     names = [f"w{i}" for i in range(6)]
     shard = tmp_path / "shard.safetensors"
@@ -211,8 +212,8 @@ def test_disk_load_context_closes_handles_on_exit(tmp_path):
     Asserts against the handle itself rather than the cache dict, because
     clearing the dict while leaking the descriptors would otherwise pass.
     """
-    from compressed_tensors.offload.cache import disk as disk_module
-    from compressed_tensors.offload.cache.disk import _opened
+    from compressed_tensors.offload.cache import disk_utils as disk_module
+    from compressed_tensors.offload.cache.disk_utils import _opened
 
     shard = tmp_path / "shard.safetensors"
     save_file({"a": torch.zeros(4)}, shard)
@@ -242,7 +243,7 @@ def test_disk_load_context_closes_handles_on_exit(tmp_path):
 @pytest.mark.unit
 def test_disk_load_context_nests(tmp_path, monkeypatch):
     """An inner context must not close handles the outer one is still using."""
-    from compressed_tensors.offload.cache import disk as disk_module
+    from compressed_tensors.offload.cache import disk_utils as disk_module
 
     offload_dir = tmp_path / "offload_dir"
     os.mkdir(offload_dir)
@@ -262,7 +263,7 @@ def test_disk_load_context_nests(tmp_path, monkeypatch):
 @pytest.mark.unit
 def test_disk_load_context_bounds_open_handles(tmp_path, monkeypatch):
     """More distinct files than the cap must not hold unbounded descriptors."""
-    from compressed_tensors.offload.cache import disk as disk_module
+    from compressed_tensors.offload.cache import disk_utils as disk_module
 
     offload_dir = tmp_path / "offload_dir"
     os.mkdir(offload_dir)
