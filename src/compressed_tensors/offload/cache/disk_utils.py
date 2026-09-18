@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import os
 import threading
 from collections import OrderedDict
 from typing import Iterator
@@ -13,8 +14,8 @@ __all__ = ["disk_load_context"]
 
 
 # Open safetensors handles held for the duration of `disk_load_context`, keyed by
-# (path, device). Thread local because handles are not safe to share across
-# threads and callers may prefetch on a background thread.
+# (resolved path, device). Thread local because handles are not safe to share
+# across threads and callers may prefetch on a background thread.
 _open_files = threading.local()
 
 # Bound on concurrently held handles, so a model with many shards cannot exhaust
@@ -71,7 +72,7 @@ def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
             yield file
         return
 
-    key = (file_path, device)
+    key = (_file_key(file_path), device)
     handle = cache.get(key)
     if handle is None:
         handle = safe_open(file_path, framework="pt", device=device)
@@ -84,3 +85,33 @@ def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
     else:
         cache.move_to_end(key)
     yield handle
+
+
+def _file_key(file_path: str) -> str:
+    """
+    Identify the file a path actually reads from.
+
+    `DiskCache.create_checkpoint_symlink` gives every tensor its own symlink,
+    named after `id(offloaded)`, pointing into a shared checkpoint shard. Keying
+    on the path as given would treat N tensors from one shard as N files, so the
+    cache would never hit on exactly the path where grouping matters.
+    """
+    return os.path.realpath(file_path)
+
+
+def _evict(file_path: str) -> None:
+    """
+    Close and drop any cached handle onto the file at `file_path`.
+
+    Must be called before that file's contents are rewritten in place. A handle
+    held inside `disk_load_context` otherwise keeps reading the old contents.
+
+    Only affects the calling thread's cache, matching `disk_load_context`,
+    which is thread local.
+    """
+    cache = getattr(_open_files, "cache", None)
+    if not cache:
+        return
+    target = _file_key(file_path)
+    for key in [key for key in cache if key[0] == target]:
+        cache.pop(key).__exit__(None, None, None)

@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Measure what `disk_load_context` saves on grouped reads from one safetensors file.
+Measure what `disk_load_context` saves when onloading many tensors from one shard.
 
-`safe_open` parses a header describing every tensor in the file, so the cost of
-opening scales with how many tensors the file holds. Opening once per read makes
-a group of N reads from one shard quadratic; holding the handle makes it linear.
+The benefit only exists on multi-tensor safetensors shards. Those reach
+`DiskCache` through `create_checkpoint_symlink`, which gives every tensor its own
+symlink into the shared shard, so that is the path measured here: real
+`DiskCache.onload` calls through per-tensor symlinks.
+
+`safe_open` parses a header describing every tensor in the file, so reopening
+the shard for each of N tensors is quadratic in N. Holding one handle makes the
+header parse happen once. What remains per read (index lookup, `to_tensor`, the
+dtype cast, resolving the symlink) is not affected, which is why the end-to-end
+ratio is smaller than the open-versus-reuse ratio alone.
 
 Run:
     python benchmarks/benchmark_disk_load_context.py
@@ -19,65 +26,71 @@ import tempfile
 import time
 
 import torch
-from compressed_tensors.offload.cache.disk import _opened, disk_load_context
+from compressed_tensors.offload.cache.disk import DiskCache
+from compressed_tensors.offload.cache.disk_utils import disk_load_context
 from safetensors.torch import save_file
 
 
 REPS = 9
 
 
-def _read_all(path: str, names: list[str]) -> None:
-    for name in names:
-        with _opened(path, "cpu") as file:
-            file.get_tensor(name)
-
-
-def _median(fn, *args) -> float:
+def _median(fn) -> float:
     times = []
     for _ in range(REPS):
         gc.collect()
         start = time.perf_counter()
-        fn(*args)
+        fn()
         times.append(time.perf_counter() - start)
     return statistics.median(times)
 
 
 def run(num_tensors: int, numel: int = 8) -> None:
-    names = [f"w{i}" for i in range(num_tensors)]
     with tempfile.TemporaryDirectory() as directory:
-        path = os.path.join(directory, "shard.safetensors")
-        save_file({n: torch.zeros(numel) for n in names}, path)
+        offload_dir = os.path.join(directory, "offload")
+        os.mkdir(offload_dir)
+        shard = os.path.join(directory, "model-00001-of-00001.safetensors")
+        save_file({f"w{i}": torch.zeros(numel) for i in range(num_tensors)}, shard)
 
-        _read_all(path, names)  # warm the page cache
+        DiskCache.index = {}
+        offloaded = []
+        for i in range(num_tensors):
+            meta = torch.empty(numel, device="meta")
+            DiskCache.create_checkpoint_symlink(
+                meta,
+                {"safetensors_file": shard, "weight_name": f"w{i}", "dtype": "float32"},
+                offload_dir,
+            )
+            offloaded.append(meta)
+        cache = DiskCache("cpu", offload_dir=offload_dir)
 
-        per_open = _median(_read_all, path, names)
+        def plain():
+            for meta in offloaded:
+                cache.onload(meta)
 
         def grouped():
             with disk_load_context():
-                _read_all(path, names)
+                for meta in offloaded:
+                    cache.onload(meta)
 
+        plain()  # warm the page cache
+        plain_time = _median(plain)
         grouped_time = _median(grouped)
 
-    per_read_us = (per_open - grouped_time) / num_tensors * 1e6
     print(
-        f"  {num_tensors:5d}  {per_open * 1e3:10.2f}  {grouped_time * 1e3:10.2f}  "
-        f"{per_open / grouped_time:7.1f}x  {per_read_us:9.1f}"
+        f"  {num_tensors:7d}  {plain_time * 1e3:10.2f}  {grouped_time * 1e3:10.2f}  "
+        f"{plain_time / grouped_time:7.1f}x"
     )
 
 
 def main() -> None:
-    print("Grouped safetensors reads from a single shard, warm page cache")
+    print("DiskCache.onload of N tensors symlinked into one shard, warm page cache")
     print(f"median of {REPS}, torch {torch.__version__}\n")
-    print(
-        f"  {'tensors':>5}  {'per-open ms':>10}  {'grouped ms':>10}  "
-        f"{'speedup':>8}  {'us/open':>9}"
-    )
-    for num_tensors in (8, 32, 128, 384, 768):
+    print(f"  {'tensors':>7}  {'plain ms':>10}  {'grouped ms':>10}  {'speedup':>8}")
+    for num_tensors in (8, 32, 128, 384):
         run(num_tensors)
     print(
-        "\nPer-open cost grows with the tensor count in the file, so reading a "
-        "group\nof N tensors one open at a time is quadratic. Holding the handle "
-        "is linear."
+        "\nThe saving grows with the number of tensors in the shard, because each"
+        "\nreopen re-parses a header whose size is proportional to that number."
     )
 
 

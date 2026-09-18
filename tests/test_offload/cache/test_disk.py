@@ -275,3 +275,97 @@ def test_disk_load_context_bounds_open_handles(tmp_path, monkeypatch):
         for name in names:
             cache[name]
         assert len(disk_module._open_files.cache) <= disk_module._MAX_OPEN_FILES
+
+
+def _symlinked_shard(tmp_path, count):
+    """A real multi-tensor shard plus one checkpoint symlink per tensor.
+
+    Mirrors `create_checkpoint_symlink`, which names each symlink after
+    `id(offloaded)`, so N tensors from one shard arrive as N distinct paths.
+    """
+    offload_dir = tmp_path / "offload_dir"
+    os.mkdir(offload_dir)
+    shard = tmp_path / "model-00001-of-00001.safetensors"
+    save_file({f"w{i}": torch.full((4,), float(i)) for i in range(count)}, shard)
+
+    DiskCache.index = {}
+    offloaded = []
+    for i in range(count):
+        meta = torch.empty(4, device="meta")
+        DiskCache.create_checkpoint_symlink(
+            meta,
+            {
+                "safetensors_file": str(shard),
+                "weight_name": f"w{i}",
+                "dtype": "float32",
+            },
+            str(offload_dir),
+        )
+        offloaded.append(meta)
+    return DiskCache("cpu", offload_dir=str(offload_dir)), offloaded
+
+
+@pytest.mark.unit
+def test_disk_load_context_hits_across_checkpoint_symlinks(tmp_path, monkeypatch):
+    """N tensors symlinked into one shard must share a single handle.
+
+    This is the path the context exists for: the O(N**2) header parse only
+    appears on multi-tensor shards, and those arrive through per-tensor
+    symlinks. Keying the cache on the given path would miss every time.
+    """
+    cache, offloaded = _symlinked_shard(tmp_path, count=8)
+    assert len({DiskCache.index[m]["safetensors_file"] for m in offloaded}) == 8
+
+    opens = _counting_safe_open(monkeypatch)
+    with disk_load_context():
+        values = [cache.onload(meta) for meta in offloaded]
+
+    assert len(opens) == 1, f"expected one open for one shard, got {len(opens)}"
+    for i, value in enumerate(values):
+        assert_tensor_equal(value, torch.full((4,), float(i)))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("symlinked", [False, True])
+def test_update_offload_is_not_served_stale_in_context(tmp_path, symlinked):
+    """A rewrite through `update_offload` must be visible inside the context.
+
+    Covers both ways `update_offload` rewrites: overwriting a CT-written file in
+    place, and replacing a checkpoint symlink with a real file.
+    """
+    if symlinked:
+        cache, offloaded = _symlinked_shard(tmp_path, count=2)
+        meta = offloaded[0]
+    else:
+        offload_dir = tmp_path / "offload_dir"
+        os.mkdir(offload_dir)
+        DiskCache.index = {}
+        cache = DiskCache("cpu", offload_dir=str(offload_dir))
+        cache["w"] = torch.full((4,), 1.0)
+        meta = cache.offloaded_values["w"]
+
+    with disk_load_context():
+        cache.onload(meta)
+        cache.update_offload(meta, torch.full((4,), 99.0))
+        assert_tensor_equal(cache.onload(meta), torch.full((4,), 99.0))
+
+
+@pytest.mark.unit
+def test_update_offload_keeps_shared_shard_handle(tmp_path, monkeypatch):
+    """Updating one symlinked tensor must not close the shard others still read.
+
+    `update_offload` replaces that tensor's symlink with its own file and leaves
+    the shard untouched, so the other tensors keep hitting the cached handle.
+    """
+    cache, offloaded = _symlinked_shard(tmp_path, count=4)
+    opens = _counting_safe_open(monkeypatch)
+    with disk_load_context():
+        for meta in offloaded:
+            cache.onload(meta)
+        cache.update_offload(offloaded[0], torch.full((4,), 99.0))
+        for i, meta in enumerate(offloaded[1:], start=1):
+            assert_tensor_equal(cache.onload(meta), torch.full((4,), float(i)))
+        assert_tensor_equal(cache.onload(offloaded[0]), torch.full((4,), 99.0))
+
+    # one open for the shard, one for the rewritten tensor's new file
+    assert len(opens) == 2, f"expected 2 opens, got {len(opens)}"
