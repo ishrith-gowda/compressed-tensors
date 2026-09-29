@@ -16,7 +16,15 @@ __all__ = ["disk_load_context"]
 # Open safetensors handles held for the duration of `disk_load_context`, keyed by
 # (resolved path, device). Thread local because handles are not safe to share
 # across threads and callers may prefetch on a background thread.
-_open_files = threading.local()
+class _OpenFiles(threading.local):
+    """Per-thread handle cache and nesting depth for `disk_load_context`."""
+
+    def __init__(self):
+        self.cache: OrderedDict | None = None
+        self.depth = 0
+
+
+_open_files = _OpenFiles()
 
 # Bound on concurrently held handles, so a model with many shards cannot exhaust
 # the process file descriptor limit. Reads within one subgraph touch very few
@@ -44,9 +52,9 @@ def disk_load_context() -> Iterator[None]:
             for subgraph in subgraphs:
                 subgraph(batch)
     """
-    if getattr(_open_files, "depth", 0) == 0:
+    if _open_files.depth == 0:
         _open_files.cache = OrderedDict()
-    _open_files.depth = getattr(_open_files, "depth", 0) + 1
+    _open_files.depth += 1
     try:
         yield
     finally:
@@ -66,7 +74,7 @@ def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
     Outside that context this is an ordinary open/close, which keeps the
     uninstrumented path byte for byte what it was.
     """
-    cache = getattr(_open_files, "cache", None)
+    cache = _open_files.cache
     if cache is None:
         with safe_open(file_path, framework="pt", device=device) as file:
             yield file
@@ -109,7 +117,7 @@ def _evict(file_path: str) -> None:
     Only affects the calling thread's cache, matching `disk_load_context`,
     which is thread local.
     """
-    cache = getattr(_open_files, "cache", None)
+    cache = _open_files.cache
     if not cache:
         return
     target = _file_key(file_path)

@@ -27,12 +27,6 @@ from tests.test_offload.conftest import assert_tensor_equal, torchrun
 from tests.testing_utils import requires_gpu
 
 
-def _init_gloo():
-    """Initialize a CPU-only gloo process group for tests that need no accelerator."""
-    if not dist.is_initialized():
-        dist.init_process_group(backend="gloo")
-
-
 @pytest.fixture()
 def onload_device():
     return torch.accelerator.current_accelerator()
@@ -250,7 +244,7 @@ def test_distributed_async_update(tmp_path):
 
 
 @pytest.mark.unit
-@torchrun(world_size=2)
+@torchrun(world_size=2, init_dist=True)
 def test_disk_load_context_is_per_rank(tmp_path_factory):
     """Each rank keeps its own handle cache and does not disturb the other's.
 
@@ -261,11 +255,6 @@ def test_disk_load_context_is_per_rank(tmp_path_factory):
     from compressed_tensors.offload.cache import disk_utils
     from compressed_tensors.offload.cache.disk_utils import _opened
 
-    # A plain gloo group on CPU, rather than `init_dist`, which derives
-    # `{accelerator}:{local_rank}` and so needs one accelerator device per rank.
-    # Nothing here touches an accelerator, so this runs on a single-GPU or
-    # CPU-only host.
-    _init_gloo()
     rank = dist.get_rank()
     # every rank writes its own shard so the test does not depend on a shared FS
     directory = tmp_path_factory.mktemp(f"shard{rank}")
@@ -292,10 +281,9 @@ def test_disk_load_context_is_per_rank(tmp_path_factory):
 
 
 @pytest.mark.unit
-@torchrun(world_size=2)
+@torchrun(world_size=2, init_dist=True)
 def test_disk_load_context_with_distributed_disk_cache(tmp_path_factory):
     """`DistributedDiskCache` onload still returns correct data inside the context."""
-    _init_gloo()
     directory = tmp_path_factory.mktemp(f"dist{dist.get_rank()}")
     offload_dir = directory / "offload"
     os.mkdir(offload_dir)
