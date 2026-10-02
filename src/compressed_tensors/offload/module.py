@@ -6,6 +6,7 @@ from functools import wraps
 
 import torch
 from compressed_tensors.offload.cache.base import OffloadCache
+from compressed_tensors.offload.cache.disk_utils import disk_load_context
 from compressed_tensors.offload.utils import send_tensors
 
 
@@ -138,14 +139,20 @@ def subgraph_stage_modules(
     modules: dict[str, torch.nn.Module],
     pin_memory: bool = False,
 ) -> None:
-    """Stage offloaded module tensors in CPU memory for a later onload."""
-    for name, module in modules.items():
-        if not isinstance(module._parameters, OffloadCache):
-            # we should consider raising warnings, but observers will
-            # clog the output with warnings, so we will skip for now
-            continue
+    """
+    Stage offloaded module tensors in CPU memory for a later onload.
 
-        stage_module_offload(module, pin_memory=pin_memory)
+    Reads are grouped under `disk_load_context`, so tensors from the same
+    safetensors shard share one open instead of re-parsing its header per read.
+    """
+    with disk_load_context():
+        for name, module in modules.items():
+            if not isinstance(module._parameters, OffloadCache):
+                # we should consider raising warnings, but observers will
+                # clog the output with warnings, so we will skip for now
+                continue
+
+            stage_module_offload(module, pin_memory=pin_memory)
 
 
 def subgraph_onload_modules(
@@ -155,16 +162,18 @@ def subgraph_onload_modules(
     from compressed_tensors.offload import get_cache_init_kwargs
 
     offload_kwargs = {}
-    for name, module in modules.items():
-        if isinstance(module._parameters, OffloadCache):
-            init_kwargs = get_cache_init_kwargs(module)
-            offload_kwargs[name] = init_kwargs
+    # tensors that were not staged are read from disk here, grouped like staging
+    with disk_load_context():
+        for name, module in modules.items():
+            if isinstance(module._parameters, OffloadCache):
+                init_kwargs = get_cache_init_kwargs(module)
+                offload_kwargs[name] = init_kwargs
 
-            remove_module_offload(module, onload_tensors=True)
-        else:
-            pass
-            # we should consider raising warnings, but observers will
-            # clog the output with warnings, so we will skip for now
+                remove_module_offload(module, onload_tensors=True)
+            else:
+                pass
+                # we should consider raising warnings, but observers will
+                # clog the output with warnings, so we will skip for now
     return offload_kwargs
 
 

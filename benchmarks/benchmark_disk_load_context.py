@@ -44,7 +44,7 @@ def _median(fn) -> float:
     return statistics.median(times)
 
 
-def run(num_tensors: int, numel: int = 8) -> None:
+def run(num_tensors: int, numel: int = 8) -> tuple[float, float]:
     with tempfile.TemporaryDirectory() as directory:
         offload_dir = os.path.join(directory, "offload")
         os.mkdir(offload_dir)
@@ -76,10 +76,42 @@ def run(num_tensors: int, numel: int = 8) -> None:
         plain_time = _median(plain)
         grouped_time = _median(grouped)
 
+    return plain_time, grouped_time
+
+
+def report(num_tensors: int) -> None:
+    plain_time, grouped_time = run(num_tensors)
     print(
         f"  {num_tensors:7d}  {plain_time * 1e3:10.2f}  {grouped_time * 1e3:10.2f}  "
         f"{plain_time / grouped_time:7.1f}x"
     )
+
+
+# Shards-per-tensor-count of real checkpoints' model.safetensors.index.json, as
+# quoted in #883: how many tensors a layer's shard actually holds.
+REAL_SHARDS = {
+    "Qwen2.5-7B / Qwen3-8B": 90,
+    "DeepSeek-V3": 586,
+    "Qwen3-30B-A3B": 1262,
+    "Kimi-K2": 2327,
+}
+LAYERS = 5
+
+
+def report_real_shards() -> None:
+    print(
+        f"\nSame measurement on real checkpoints' tensors-per-shard, {LAYERS}"
+        " independent decoder layers each (fresh shard per layer, warm page cache)"
+    )
+    print(f"  {'model':>22}  {'tensors':>7}  speedup (mean ± stdev over layers)")
+    for name, num_tensors in REAL_SHARDS.items():
+        speedups = []
+        for _ in range(LAYERS):
+            plain_time, grouped_time = run(num_tensors)
+            speedups.append(plain_time / grouped_time)
+        mean = statistics.mean(speedups)
+        stdev = statistics.stdev(speedups) if len(speedups) > 1 else 0.0
+        print(f"  {name:>22}  {num_tensors:7d}  {mean:5.1f}x ± {stdev:.1f}")
 
 
 def main() -> None:
@@ -87,11 +119,12 @@ def main() -> None:
     print(f"median of {REPS}, torch {torch.__version__}\n")
     print(f"  {'tensors':>7}  {'plain ms':>10}  {'grouped ms':>10}  {'speedup':>8}")
     for num_tensors in (8, 32, 128, 384):
-        run(num_tensors)
+        report(num_tensors)
     print(
         "\nThe saving grows with the number of tensors in the shard, because each"
         "\nreopen re-parses a header whose size is proportional to that number."
     )
+    report_real_shards()
 
 
 if __name__ == "__main__":
